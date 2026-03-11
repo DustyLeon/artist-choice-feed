@@ -165,16 +165,42 @@ def search_youtube(artist: str, yt, recent_ids: set[str]) -> tuple[str, str] | t
 
             artist_lower = artist.lower()
 
-            # Separate preferred (official channel heuristic) from fallback
+            # Split artist name into words for partial matching
+            # e.g. "Hot Chip" -> ["hot", "chip"]
+            artist_words = set(artist_lower.split())
+
+            def artist_in_text(text: str) -> bool:
+                t = text.lower()
+                # Full artist name match is best
+                if artist_lower in t:
+                    return True
+                # For multi-word artists, check if most words appear
+                if len(artist_words) > 1:
+                    matches = sum(1 for w in artist_words if w in t)
+                    return matches >= len(artist_words) - 1
+                return False
+
             preferred = []
             fallback = []
+            rejected = []
+
             for item in items:
                 vid_id = item['id']['videoId']
                 if vid_id in recent_ids:
                     log.info(f'Skipping recent duplicate: {vid_id}')
                     continue
-                channel = item['snippet']['channelTitle'].lower()
-                if artist_lower in channel or 'vevo' in channel or 'official' in channel:
+                channel = item['snippet']['channelTitle']
+                title   = item['snippet']['title']
+
+                channel_match = artist_in_text(channel) or 'vevo' in channel.lower() or 'official' in channel.lower()
+                title_match   = artist_in_text(title)
+
+                if not channel_match and not title_match:
+                    log.info(f'Rejecting "{title}" by "{channel}" — no artist name match')
+                    rejected.append(vid_id)
+                    continue
+
+                if channel_match:
                     preferred.append(vid_id)
                 else:
                     fallback.append(vid_id)
@@ -183,6 +209,9 @@ def search_youtube(artist: str, yt, recent_ids: set[str]) -> tuple[str, str] | t
                 url = f'https://www.youtube.com/watch?v={vid_id}'
                 log.info(f'YT selected: {vid_id} for "{artist}"')
                 return vid_id, url
+
+            # If everything was rejected on this query, try the next query template
+            # rather than falling through to a bad result
 
         except Exception as e:
             log.warning(f'YouTube search error for "{query}": {e}')
