@@ -15,7 +15,10 @@ import os
 import random
 import sqlite3
 import logging
+import time
 from datetime import time as dtime
+
+DUPLICATE_WINDOW_DAYS = 30
 
 import discord
 from discord import app_commands
@@ -64,6 +67,10 @@ def init_db():
         );
         CREATE TABLE IF NOT EXISTS artist_pool (
             artist_name TEXT PRIMARY KEY COLLATE NOCASE
+        );
+        CREATE TABLE IF NOT EXISTS posted_videos (
+            video_id    TEXT PRIMARY KEY,
+            posted_at   INTEGER NOT NULL  -- Unix timestamp
         );
     ''')
     conn.commit()
@@ -115,8 +122,32 @@ YT_QUERIES = [
     '{artist}',
 ]
 
-def search_youtube(artist: str, yt) -> str | None:
-    """Search YouTube for official audio/video. Returns a URL or None."""
+def get_recent_video_ids() -> set[str]:
+    """Return video IDs posted within the duplicate window."""
+    cutoff = int(time.time()) - DUPLICATE_WINDOW_DAYS * 86400
+    conn = open_db()
+    rows = conn.execute(
+        'SELECT video_id FROM posted_videos WHERE posted_at > ?', (cutoff,)
+    ).fetchall()
+    conn.close()
+    return {row['video_id'] for row in rows}
+
+def record_video(video_id: str):
+    """Save a posted video ID with the current timestamp."""
+    conn = open_db()
+    conn.execute(
+        'INSERT OR REPLACE INTO posted_videos (video_id, posted_at) VALUES (?, ?)',
+        (video_id, int(time.time()))
+    )
+    # Clean up entries older than the window while we're here
+    cutoff = int(time.time()) - DUPLICATE_WINDOW_DAYS * 86400
+    conn.execute('DELETE FROM posted_videos WHERE posted_at <= ?', (cutoff,))
+    conn.commit()
+    conn.close()
+
+def search_youtube(artist: str, yt, recent_ids: set[str]) -> tuple[str, str] | tuple[None, None]:
+    """Search YouTube for official audio/video, skipping recently posted videos.
+    Returns (video_id, url) or (None, None)."""
     for template in YT_QUERIES:
         query = template.format(artist=artist)
         try:
@@ -124,33 +155,39 @@ def search_youtube(artist: str, yt) -> str | None:
                 q=query,
                 part='snippet',
                 type='video',
-                videoCategoryId='10',   # Music category
-                maxResults=3,
+                videoCategoryId='10',
+                maxResults=5,  # Increased to give more candidates for dedup
             ).execute()
 
             items = resp.get('items', [])
             if not items:
                 continue
 
-            # Prefer results whose channel title contains the artist name
-            # (catches VEVO channels and official artist channels)
             artist_lower = artist.lower()
+
+            # Separate preferred (official channel heuristic) from fallback
+            preferred = []
+            fallback = []
             for item in items:
+                vid_id = item['id']['videoId']
+                if vid_id in recent_ids:
+                    log.info(f'Skipping recent duplicate: {vid_id}')
+                    continue
                 channel = item['snippet']['channelTitle'].lower()
                 if artist_lower in channel or 'vevo' in channel or 'official' in channel:
-                    vid_id = item['id']['videoId']
-                    log.info(f'YT match (channel heuristic): {item["snippet"]["channelTitle"]}')
-                    return f'https://www.youtube.com/watch?v={vid_id}'
+                    preferred.append(vid_id)
+                else:
+                    fallback.append(vid_id)
 
-            # Fall back to the first result if heuristic finds nothing
-            vid_id = items[0]['id']['videoId']
-            log.info(f'YT fallback result for "{query}"')
-            return f'https://www.youtube.com/watch?v={vid_id}'
+            for vid_id in preferred + fallback:
+                url = f'https://www.youtube.com/watch?v={vid_id}'
+                log.info(f'YT selected: {vid_id} for "{artist}"')
+                return vid_id, url
 
         except Exception as e:
             log.warning(f'YouTube search error for "{query}": {e}')
 
-    return None
+    return None, None
 
 # ── Bot ────────────────────────────────────────────────────────────────────────
 
@@ -185,22 +222,31 @@ class ArtistFeedBot(discord.Client):
             log.warning('Artist pool is empty — skipping post')
             return None
 
-        artist = random.choice(rows)['artist_name']
-        log.info(f'Selected artist: {artist}')
+        recent_ids = get_recent_video_ids()
+        candidates = list(rows)
+        random.shuffle(candidates)
 
-        url = search_youtube(artist, self.yt)
-        if not url:
-            log.warning(f'No YouTube result found for "{artist}"')
-            return None
+        # Try up to 5 artists before giving up
+        for row in candidates[:5]:
+            artist = row['artist_name']
+            log.info(f'Trying artist: {artist}')
+            vid_id, url = search_youtube(artist, self.yt, recent_ids)
+            if not url:
+                log.warning(f'No fresh YouTube result for "{artist}", trying next artist')
+                continue
 
-        channel = self.get_channel(FEED_CHANNEL_ID)
-        if not channel:
-            log.error(f'Could not find channel {FEED_CHANNEL_ID}')
-            return None
+            channel = self.get_channel(FEED_CHANNEL_ID)
+            if not channel:
+                log.error(f'Could not find channel {FEED_CHANNEL_ID}')
+                return None
 
-        await channel.send(f'🎵 **{artist}**\n{url}')
-        log.info(f'Posted: {artist} — {url}')
-        return artist
+            record_video(vid_id)
+            await channel.send(f'🎵 **{artist}**\n{url}')
+            log.info(f'Posted: {artist} — {url}')
+            return artist
+
+        log.warning('Could not find a fresh video after 5 attempts')
+        return None
 
     # Refresh pool once a day at 06:00 UTC
     @tasks.loop(time=dtime(hour=6, minute=0))
