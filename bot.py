@@ -312,6 +312,25 @@ async def add_artist(interaction: discord.Interaction, artist: str):
     )
 
 @bot.tree.command(
+    name='refresh',
+    description='Manually rebuild the artist pool from Last.fm (admin only)'
+)
+async def refresh_pool(interaction: discord.Interaction):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message(
+            '⛔ Only server admins can trigger a pool refresh.', ephemeral=True
+        )
+        return
+    await interaction.response.defer(ephemeral=True)
+    rebuild_pool(bot.lastfm)
+    conn = open_db()
+    count = conn.execute('SELECT COUNT(*) FROM artist_pool').fetchone()[0]
+    conn.close()
+    await interaction.followup.send(
+        f'✅ Pool refreshed — **{count}** artists now in the pool.', ephemeral=True
+    )
+
+@bot.tree.command(
     name='random',
     description='Post a bonus track from the pool right now'
 )
